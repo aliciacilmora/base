@@ -15,18 +15,22 @@ impl TxCutoff {
     /// Computes `slot_start + seal_offset` for the block timestamp and converts it to a monotonic
     /// deadline.
     pub fn new(block_timestamp_ms: u64, seal_offset: Duration) -> Self {
-        let slot_start =
-            block_timestamp_ms.saturating_sub(u64::from(BaseTimeUpdateTx::BLOCK_INTERVAL_MILLIS));
-        let offset = u64::try_from(seal_offset.as_millis()).unwrap_or(u64::MAX);
-        let unix_millis = slot_start.saturating_add(offset);
+        let slot_start = block_timestamp_ms - u64::from(BaseTimeUpdateTx::BLOCK_INTERVAL_MILLIS);
+        let offset =
+            u64::try_from(seal_offset.as_millis()).expect("seal offset milliseconds fit in u64");
+        let unix_millis = slot_start + offset;
         let now = Instant::now();
         let unix_now_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+            .expect("system time is after the Unix epoch")
+            .as_millis()
+            .try_into()
+            .expect("Unix time milliseconds fit in u64");
         let instant = if unix_millis >= unix_now_millis {
-            now.checked_add(Duration::from_millis(unix_millis - unix_now_millis)).unwrap_or(now)
+            now.checked_add(Duration::from_millis(unix_millis - unix_now_millis))
+                .expect("cutoff deadline fits in Instant")
         } else {
-            now.checked_sub(Duration::from_millis(unix_now_millis - unix_millis)).unwrap_or(now)
+            now
         };
 
         Self { instant, unix_millis }
@@ -55,7 +59,10 @@ mod tests {
 
     #[test]
     fn past_cutoff_is_past() {
-        assert!(TxCutoff::new(0, Duration::ZERO).is_past());
+        assert!(
+            TxCutoff::new(u64::from(BaseTimeUpdateTx::BLOCK_INTERVAL_MILLIS), Duration::ZERO)
+                .is_past()
+        );
     }
 
     #[test]

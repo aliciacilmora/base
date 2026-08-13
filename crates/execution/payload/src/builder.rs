@@ -658,11 +658,8 @@ where
             .ok_or_else(|| metadata_error(BaseTimeMetadataError::NotDeposit))?;
         let base_time =
             BaseTimeUpdateTx::validate_deposit(deposit, block_number).map_err(metadata_error)?;
-        let block_timestamp_ms = self
-            .attributes()
-            .timestamp()
-            .saturating_mul(1_000)
-            .saturating_add(u64::from(base_time.timestamp_millis_part()));
+        let block_timestamp_ms =
+            self.attributes().timestamp() * 1_000 + u64::from(base_time.timestamp_millis_part());
 
         Ok(Some(TxCutoff::new(block_timestamp_ms, self.builder_config.seal_offset)))
     }
@@ -1222,7 +1219,7 @@ mod tests {
                 .as_millis(),
         )
         .expect("current time fits in u64")
-        .saturating_add(u64::try_from(delay.as_millis()).expect("test delay fits in u64"));
+            + u64::try_from(delay.as_millis()).expect("test delay fits in u64");
         Duration::from_millis(target_unix_ms - DENIM_TIMESTAMP * 1_000)
     }
 

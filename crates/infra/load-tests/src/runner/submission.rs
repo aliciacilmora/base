@@ -87,6 +87,15 @@ impl SubmitCohort {
             Self::ValidityControl => "validity_control",
         }
     }
+
+    /// Maps the cohort to its serializable metrics label.
+    pub const fn to_metric_label(self) -> crate::metrics::SubmitCohortLabel {
+        match self {
+            Self::Plain => crate::metrics::SubmitCohortLabel::Plain,
+            Self::ValidityPass => crate::metrics::SubmitCohortLabel::ValidityPass,
+            Self::ValidityControl => crate::metrics::SubmitCohortLabel::ValidityControl,
+        }
+    }
 }
 
 /// EIP-1559 fee fields for a transaction.
@@ -1090,6 +1099,7 @@ impl SubmissionPipeline {
             from: signed.from,
             estimated_gas: signed.estimated_gas,
             measured,
+            cohort: signed.cohort,
         }]);
         Self::release_signed(&ctx.submit_event_tx, &signed, true).await;
         let _ = ctx.submit_event_tx.send(SubmitEvent::Submitted(tracked_hash)).await;

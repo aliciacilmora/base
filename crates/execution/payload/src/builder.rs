@@ -1,5 +1,5 @@
 //! Base payload builder implementation.
-use std::{marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc, time::Instant};
 
 use alloy_consensus::{BlockHeader, Transaction, Typed2718};
 use alloy_evm::Evm as AlloyEvm;
@@ -11,6 +11,7 @@ use base_common_consensus::{BaseTransaction, Predeploys};
 use base_common_evm::L1BlockInfo;
 use base_execution_eip8130::IntrinsicGas;
 use base_execution_txpool::{BasePooledTx, GuardMetrics, estimated_da_size::DataAvailabilitySized};
+use base_protocol::{BaseTimeMetadataError, BaseTimeUpdateTx};
 use reth_basic_payload_builder::{
     BuildArguments, BuildOutcome, BuildOutcomeKind, MissingPayloadBehaviour, PayloadBuilder,
     PayloadConfig, is_better_payload,
@@ -43,7 +44,8 @@ use tracing::{debug, debug_span, instrument, trace, warn};
 
 use crate::{
     Attributes, BasePayloadBuilderAttributes, PayloadPrimitives, config::BaseBuilderConfig,
-    error::BasePayloadBuilderError, payload::BaseBuiltPayload,
+    error::BasePayloadBuilderError, metrics::PayloadBuilderMetrics, payload::BaseBuiltPayload,
+    timing::TxCutoff,
 };
 
 /// Base payload builder
@@ -191,7 +193,8 @@ where
         }
         let state = StateProviderDatabase::new(state_provider.as_ref());
 
-        if ctx.attributes().no_tx_pool() {
+        let build_started_at = Instant::now();
+        let outcome = if ctx.attributes().no_tx_pool() {
             builder.build(state, state_provider.as_ref(), state_root_handle, ctx)
         } else {
             // sequencer mode we can reuse cachedreads from previous runs
@@ -202,7 +205,12 @@ where
                 ctx,
             )
         }
-        .map(|out| out.with_cached_reads(cached_reads))
+        .map(|out| out.with_cached_reads(cached_reads));
+        if outcome.is_ok() {
+            PayloadBuilderMetrics::build_duration()
+                .record(build_started_at.elapsed().as_secs_f64());
+        }
+        outcome
     }
 
     /// Computes the witness for the payload.
@@ -372,7 +380,7 @@ impl<Txs> Builder<'_, Txs> {
             }
 
             // check if the new payload is even more valuable
-            if !ctx.is_better_payload(info.total_fees) {
+            if !ctx.is_denim_active() && !ctx.is_better_payload(info.total_fees) {
                 // can skip building the block
                 return Ok(BuildOutcomeKind::Aborted { fees: info.total_fees });
             }
@@ -437,10 +445,11 @@ impl<Txs> Builder<'_, Txs> {
             block_access_list.map(|bal| alloy_rlp::encode(bal).into()),
         );
 
-        if no_tx_pool {
+        if no_tx_pool || ctx.is_denim_active() {
             // if `no_tx_pool` is set only transactions from the payload attributes will be included
             // in the payload. In other words, the payload is deterministic and we can
             // freeze it once we've successfully built it.
+            // Denim-active sequencer builds freeze after their bounded pool-transaction phase.
             Ok(BuildOutcomeKind::Freeze(payload))
         } else {
             Ok(BuildOutcomeKind::Better { payload })
@@ -624,6 +633,40 @@ where
         &self.config.attributes
     }
 
+    /// Returns `true` if Denim is active at this payload's timestamp.
+    pub fn is_denim_active(&self) -> bool {
+        self.chain_spec.is_denim_active_at_timestamp(self.attributes().timestamp())
+    }
+
+    /// Derives the pool-transaction cutoff from the `BaseTime` metadata deposit.
+    pub fn tx_cutoff(&self) -> Result<Option<TxCutoff>, PayloadBuilderError> {
+        if !self.is_denim_active() {
+            return Ok(None);
+        }
+
+        let block_number = self.parent().number().saturating_add(1);
+        let metadata_error =
+            |error| PayloadBuilderError::other(BasePayloadBuilderError::BaseTimeMetadata(error));
+        let transaction = self
+            .attributes()
+            .sequencer_transactions()
+            .get(1)
+            .ok_or_else(|| metadata_error(BaseTimeMetadataError::Missing))?;
+        let deposit = transaction
+            .value()
+            .as_deposit()
+            .ok_or_else(|| metadata_error(BaseTimeMetadataError::NotDeposit))?;
+        let base_time =
+            BaseTimeUpdateTx::validate_deposit(deposit, block_number).map_err(metadata_error)?;
+        let block_timestamp_ms = self
+            .attributes()
+            .timestamp()
+            .saturating_mul(1_000)
+            .saturating_add(u64::from(base_time.timestamp_millis_part()));
+
+        Ok(Some(TxCutoff::new(block_timestamp_ms, self.builder_config.seal_offset)))
+    }
+
     /// Returns the current fee settings for transactions from the mempool
     pub fn best_transaction_attributes(&self, block_env: impl Block) -> BestTransactionsAttributes {
         BestTransactionsAttributes::new(
@@ -751,8 +794,42 @@ where
         let tx_da_limit = self.builder_config.da_config.max_da_tx_size();
         let base_fee = builder.evm_mut().block().basefee();
 
+        if self.cancel.is_cancelled() {
+            return Ok(Some(()));
+        }
+        let tx_cutoff = self.tx_cutoff()?;
+        if let Some(cutoff) = tx_cutoff
+            && cutoff.is_past()
+        {
+            debug!(
+                target: "payload_builder",
+                cutoff_unix_ms = cutoff.unix_millis(),
+                "build started past pool-transaction cutoff"
+            );
+            PayloadBuilderMetrics::zero_pool_tx_builds().increment(1);
+            return Ok(None);
+        }
+
         let block_timestamp = self.attributes().timestamp();
-        while let Some(tx) = best_txs.next(()) {
+        loop {
+            if self.cancel.is_cancelled() {
+                return Ok(Some(()));
+            }
+            if let Some(cutoff) = tx_cutoff
+                && cutoff.is_past()
+            {
+                debug!(
+                    target: "payload_builder",
+                    cutoff_unix_ms = cutoff.unix_millis(),
+                    "pool-transaction cutoff reached"
+                );
+                PayloadBuilderMetrics::cutoff_truncated_builds().increment(1);
+                break;
+            }
+            let Some(tx) = best_txs.next(()) else {
+                break;
+            };
+
             if self.builder_config.manifest_precheck_enabled
                 && let Some(manifest) = tx.watch_manifest()
                 && let Err(stale) = manifest.revalidate(builder.evm_mut().db_mut(), block_timestamp)
@@ -833,11 +910,6 @@ where
                 continue;
             }
 
-            // check if the job was cancelled, if so we can exit early
-            if self.cancel.is_cancelled() {
-                return Ok(Some(()));
-            }
-
             let gas_output = match builder.execute_transaction(tx.clone()) {
                 Ok(gas_output) => gas_output,
                 Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
@@ -866,27 +938,47 @@ where
             info.total_fees += U256::from(miner_fee) * U256::from(gas_output.tx_gas_used());
         }
 
+        if self.cancel.is_cancelled() {
+            return Ok(Some(()));
+        }
+
         Ok(None)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
-    use alloy_consensus::Header;
-    use alloy_primitives::B256;
-    use base_common_consensus::{BasePrimitives, BaseTxEnvelope};
-    use base_execution_chainspec::BaseChainSpec;
+    use alloy_consensus::{Header, Sealable, SignableTransaction, TxEip1559};
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_primitives::{Address, B256, Signature, StorageKey, TxKind, U256};
+    use base_common_chains::BaseUpgrade;
+    use base_common_consensus::{BasePrimitives, BaseTxEnvelope, Predeploys, TxDeposit};
+    use base_common_evm::BaseTime;
+    use base_execution_chainspec::{BaseChainSpec, BaseChainSpecBuilder};
     use base_execution_evm::BaseEvmConfig;
     use base_execution_txpool::BasePooledTransaction;
+    use base_protocol::BaseTimeUpdateTx;
     use reth_basic_payload_builder::{BuildOutcomeKind, PayloadConfig};
     use reth_chainspec::ChainSpec;
+    use reth_ethereum_forks::ForkCondition;
     use reth_payload_builder::PayloadId;
-    use reth_payload_util::NoopPayloadTransactions;
-    use reth_primitives_traits::SealedHeader;
+    use reth_payload_util::{NoopPayloadTransactions, PayloadTransactions};
+    use reth_primitives_traits::{Account, SealedHeader, SignedTransaction, WithEncoded};
     use reth_provider::noop::NoopProvider;
-    use reth_revm::database::StateProviderDatabase;
+    use reth_revm::{
+        cancelled::CancelOnDrop, database::StateProviderDatabase, test_utils::StateProviderTest,
+    };
+    use reth_transaction_pool::PoolTransaction;
     use reth_trie_common::{HashedPostState, updates::TrieUpdates};
     use reth_trie_parallel::{
         error::StateRootTaskError,
@@ -985,5 +1077,257 @@ mod tests {
     #[test]
     fn parallel_state_root_is_used() {
         assert_eq!(build_empty_payload(state_root_handle()), B256::repeat_byte(0x42));
+    }
+
+    const DENIM_TIMESTAMP: u64 = 1;
+    const PARENT_NUMBER: u64 = 8;
+
+    fn cutoff_ctx(
+        timestamp: u64,
+        transactions: Vec<WithEncoded<BaseTxEnvelope>>,
+    ) -> BasePayloadBuilderCtx<BaseEvmConfig, BaseChainSpec> {
+        let chain_spec = Arc::new(
+            BaseChainSpecBuilder::base_mainnet()
+                .with_fork(BaseUpgrade::Denim, ForkCondition::Timestamp(DENIM_TIMESTAMP))
+                .build(),
+        );
+        let attributes = BasePayloadBuilderAttributes::<BaseTxEnvelope> {
+            payload_attributes: EthPayloadBuilderAttributes { timestamp, ..Default::default() },
+            transactions,
+            gas_limit: Some(30_000_000),
+            ..Default::default()
+        };
+        let payload_id = attributes.payload_attributes.id;
+        let parent = SealedHeader::seal_slow(Header {
+            number: PARENT_NUMBER,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        });
+        BasePayloadBuilderCtx {
+            evm_config: BaseEvmConfig::base(Arc::clone(&chain_spec)),
+            builder_config: BaseBuilderConfig::default(),
+            chain_spec,
+            config: PayloadConfig::new(Arc::new(parent), attributes, payload_id),
+            cancel: Default::default(),
+            best_payload: None,
+        }
+    }
+
+    fn build_pool_payload<Txs>(
+        ctx: BasePayloadBuilderCtx<BaseEvmConfig, BaseChainSpec>,
+        transactions: Txs,
+    ) -> BuildOutcomeKind<crate::BaseBuiltPayload<BasePrimitives>>
+    where
+        Txs: PayloadTransactions<Transaction = BasePooledTransaction> + Send + Sync,
+    {
+        let mut storage = HashMap::default();
+        storage.insert(
+            StorageKey::from(BaseTime::ADMIN_SLOT.to_be_bytes::<32>()),
+            U256::from_be_slice(Predeploys::PROXY_ADMIN.as_slice()),
+        );
+        let mut provider = StateProviderTest::default();
+        provider.insert_account(
+            Predeploys::BASE_TIME,
+            Account::default(),
+            Some(BaseTime::proxy_bytecode()),
+            storage,
+        );
+        provider.insert_account(
+            pool_transaction().sender(),
+            Account { balance: U256::MAX, ..Default::default() },
+            None,
+            HashMap::default(),
+        );
+        Builder::new(|_| transactions)
+            .build(StateProviderDatabase::new(&provider), &provider, Some(state_root_handle()), ctx)
+            .expect("payload must build")
+    }
+
+    struct NeverPullTransactions;
+
+    impl PayloadTransactions for NeverPullTransactions {
+        type Transaction = BasePooledTransaction;
+
+        fn next(&mut self, _ctx: ()) -> Option<Self::Transaction> {
+            panic!("past-cutoff build must not pull a pool transaction")
+        }
+
+        fn mark_invalid(&mut self, _sender: Address, _nonce: u64) {}
+    }
+
+    struct SlowFirstTransaction {
+        transaction: Option<BasePooledTransaction>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl PayloadTransactions for SlowFirstTransaction {
+        type Transaction = BasePooledTransaction;
+
+        fn next(&mut self, _ctx: ()) -> Option<Self::Transaction> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                thread::sleep(Duration::from_millis(1_100));
+                self.transaction.take()
+            } else {
+                None
+            }
+        }
+
+        fn mark_invalid(&mut self, _sender: Address, _nonce: u64) {}
+    }
+
+    struct CancelAfterFirstTransaction {
+        transaction: Option<BasePooledTransaction>,
+        cancel: Option<CancelOnDrop>,
+    }
+
+    impl PayloadTransactions for CancelAfterFirstTransaction {
+        type Transaction = BasePooledTransaction;
+
+        fn next(&mut self, _ctx: ()) -> Option<Self::Transaction> {
+            if let Some(transaction) = self.transaction.take() {
+                Some(transaction)
+            } else {
+                drop(self.cancel.take());
+                None
+            }
+        }
+
+        fn mark_invalid(&mut self, _sender: Address, _nonce: u64) {}
+    }
+
+    fn pool_transaction() -> BasePooledTransaction {
+        let envelope = BaseTxEnvelope::Eip1559(
+            TxEip1559 {
+                chain_id: 8_453,
+                gas_limit: 100_000,
+                max_fee_per_gas: 2_000_000_000,
+                max_priority_fee_per_gas: 1,
+                to: TxKind::Call(Address::repeat_byte(0x11)),
+                ..Default::default()
+            }
+            .into_signed(Signature::test_signature()),
+        );
+        let encoded_len = envelope.encode_2718_len();
+        BasePooledTransaction::new(
+            envelope.try_into_recovered().expect("test signature must recover"),
+            encoded_len,
+        )
+    }
+
+    fn seal_offset_for_cutoff_after(delay: Duration) -> Duration {
+        let target_unix_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time after Unix epoch")
+                .as_millis(),
+        )
+        .expect("current time fits in u64")
+        .saturating_add(u64::try_from(delay.as_millis()).expect("test delay fits in u64"));
+        Duration::from_millis(target_unix_ms - DENIM_TIMESTAMP * 1_000)
+    }
+
+    fn sequencer_txs_with_base_time(
+        block_number: u64,
+        millis_part: u16,
+    ) -> Vec<WithEncoded<BaseTxEnvelope>> {
+        let metadata =
+            BaseTimeUpdateTx::new(millis_part).expect("valid millis").into_deposit_tx(block_number);
+        vec![
+            WithEncoded::from_2718_encodable(TxDeposit::default().seal_slow().into()),
+            WithEncoded::from_2718_encodable(metadata.into()),
+        ]
+    }
+
+    #[test]
+    fn pre_denim_has_no_tx_cutoff() {
+        let ctx = cutoff_ctx(DENIM_TIMESTAMP - 1, vec![]);
+        assert!(!ctx.is_denim_active());
+        assert!(ctx.tx_cutoff().expect("pre-Denim cutoff is valid").is_none());
+    }
+
+    #[test]
+    fn denim_tx_cutoff_is_slot_start_plus_seal_offset() {
+        let ctx = cutoff_ctx(DENIM_TIMESTAMP, sequencer_txs_with_base_time(PARENT_NUMBER + 1, 200));
+        let cutoff = ctx.tx_cutoff().expect("valid metadata").expect("Denim is active");
+        assert_eq!(cutoff.unix_millis(), DENIM_TIMESTAMP * 1_000 + 150);
+    }
+
+    #[test]
+    fn denim_cutoff_freezes_attribute_only_payload() {
+        let ctx = cutoff_ctx(DENIM_TIMESTAMP, sequencer_txs_with_base_time(PARENT_NUMBER + 1, 200));
+        let BuildOutcomeKind::Freeze(payload) = build_pool_payload(ctx, NeverPullTransactions)
+        else {
+            panic!("Denim payload must freeze")
+        };
+        assert_eq!(payload.block().body().transactions.len(), 2);
+    }
+
+    #[test]
+    fn denim_cutoff_preserves_accumulated_pool_transactions() {
+        let mut ctx =
+            cutoff_ctx(DENIM_TIMESTAMP, sequencer_txs_with_base_time(PARENT_NUMBER + 1, 200));
+        ctx.builder_config.seal_offset = seal_offset_for_cutoff_after(Duration::from_secs(1));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let transactions = SlowFirstTransaction {
+            transaction: Some(pool_transaction()),
+            calls: Arc::clone(&calls),
+        };
+
+        let BuildOutcomeKind::Freeze(payload) = build_pool_payload(ctx, transactions) else {
+            panic!("Denim payload must freeze")
+        };
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(payload.block().body().transactions.len(), 3);
+    }
+
+    #[test]
+    fn pre_denim_pool_payload_remains_better() {
+        assert!(matches!(
+            build_pool_payload(
+                cutoff_ctx(DENIM_TIMESTAMP - 1, vec![]),
+                NoopPayloadTransactions::<BasePooledTransaction>::default()
+            ),
+            BuildOutcomeKind::Better { .. }
+        ));
+    }
+
+    #[test]
+    fn cancellation_takes_precedence_over_denim_cutoff() {
+        let ctx = cutoff_ctx(DENIM_TIMESTAMP, sequencer_txs_with_base_time(PARENT_NUMBER + 1, 200));
+        drop(ctx.cancel.clone());
+        assert!(matches!(
+            build_pool_payload(ctx, NoopPayloadTransactions::<BasePooledTransaction>::default()),
+            BuildOutcomeKind::Cancelled
+        ));
+    }
+
+    #[test]
+    fn mid_build_cancellation_discards_accumulated_transactions() {
+        let mut ctx =
+            cutoff_ctx(DENIM_TIMESTAMP, sequencer_txs_with_base_time(PARENT_NUMBER + 1, 200));
+        ctx.builder_config.seal_offset = seal_offset_for_cutoff_after(Duration::from_secs(60));
+        let transactions = CancelAfterFirstTransaction {
+            transaction: Some(pool_transaction()),
+            cancel: Some(ctx.cancel.clone()),
+        };
+
+        assert!(matches!(build_pool_payload(ctx, transactions), BuildOutcomeKind::Cancelled));
+    }
+
+    #[test]
+    fn denim_missing_base_time_metadata_is_a_build_error() {
+        let error = cutoff_ctx(DENIM_TIMESTAMP, vec![])
+            .tx_cutoff()
+            .expect_err("missing metadata must fail");
+        assert!(error.to_string().contains("invalid BaseTime metadata"));
+    }
+
+    #[test]
+    fn denim_invalid_base_time_metadata_is_a_build_error() {
+        let error =
+            cutoff_ctx(DENIM_TIMESTAMP, sequencer_txs_with_base_time(PARENT_NUMBER + 2, 200))
+                .tx_cutoff()
+                .expect_err("invalid metadata must fail");
+        assert!(error.to_string().contains("invalid BaseTime metadata"));
     }
 }

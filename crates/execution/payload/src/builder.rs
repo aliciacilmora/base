@@ -660,8 +660,10 @@ where
             BaseTimeUpdateTx::validate_deposit(deposit, block_number).map_err(metadata_error)?;
         let block_timestamp_ms =
             self.attributes().timestamp() * 1_000 + u64::from(base_time.timestamp_millis_part());
+        let cutoff = TxCutoff::new(block_timestamp_ms, self.builder_config.seal_offset)
+            .map_err(PayloadBuilderError::other)?;
 
-        Ok(Some(TxCutoff::new(block_timestamp_ms, self.builder_config.seal_offset)))
+        Ok(Some(cutoff))
     }
 
     /// Returns the current fee settings for transactions from the mempool
@@ -800,7 +802,7 @@ where
         {
             debug!(
                 target: "payload_builder",
-                cutoff_unix_ms = cutoff.unix_millis(),
+                cutoff_unix_ms = cutoff.cutoff_time_ms(),
                 "build started past pool-transaction cutoff"
             );
             PayloadBuilderMetrics::zero_pool_tx_builds().increment(1);
@@ -817,7 +819,7 @@ where
             {
                 debug!(
                     target: "payload_builder",
-                    cutoff_unix_ms = cutoff.unix_millis(),
+                    cutoff_unix_ms = cutoff.cutoff_time_ms(),
                     "pool-transaction cutoff reached"
                 );
                 PayloadBuilderMetrics::cutoff_truncated_builds().increment(1);
@@ -1246,7 +1248,7 @@ mod tests {
     fn denim_tx_cutoff_is_slot_start_plus_seal_offset() {
         let ctx = cutoff_ctx(DENIM_TIMESTAMP, sequencer_txs_with_base_time(PARENT_NUMBER + 1, 200));
         let cutoff = ctx.tx_cutoff().expect("valid metadata").expect("Denim is active");
-        assert_eq!(cutoff.unix_millis(), DENIM_TIMESTAMP * 1_000 + 150);
+        assert_eq!(cutoff.cutoff_time_ms(), DENIM_TIMESTAMP * 1_000 + 150);
     }
 
     #[test]

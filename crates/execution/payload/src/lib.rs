@@ -18,7 +18,7 @@ pub use metrics::PayloadBuilderMetrics;
 pub mod payload;
 pub use payload::{BaseBuiltPayload, BasePayloadBuilderAttributes};
 mod timing;
-pub use timing::TxCutoff;
+pub use timing::{TxCutoff, TxCutoffError};
 mod traits;
 pub use traits::*;
 mod types;

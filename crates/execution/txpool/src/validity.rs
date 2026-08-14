@@ -9,6 +9,31 @@ use crate::{BasePooledTransaction, ExtensionError, ValidatedTransactionExtension
 /// Maximum number of experimental validity predicates carried by one transaction.
 pub const MAX_VALIDITY_PREDICATES: usize = 64;
 
+/// Error returned when a batch of validity predicates fails ingress validation.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ValidityPredicateError {
+    /// The submission carried no predicates.
+    ///
+    /// A predicate-less submission has no advanced semantics to enforce, so it is
+    /// rejected rather than treated as a plain private transaction.
+    #[error("validity predicates must not be empty")]
+    Empty,
+    /// The submission carried more predicates than [`MAX_VALIDITY_PREDICATES`].
+    #[error("too many validity predicates: {count} (maximum {max})")]
+    TooMany {
+        /// Number of predicates supplied.
+        count: usize,
+        /// Maximum number of predicates permitted.
+        max: usize,
+    },
+    /// A storage predicate's comparison value has bits set outside its mask.
+    ///
+    /// Because the loaded storage value is masked before comparison, bits set in
+    /// `value` outside `mask` could never match and indicate a malformed request.
+    #[error("storage predicate value has bits set outside its mask")]
+    StorageValueOutsideMask,
+}
+
 /// A comparison used by a [`ValidityPredicate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum ValidityOperator {
@@ -87,6 +112,39 @@ impl ValidityPredicate {
     #[must_use]
     pub const fn default_mask() -> U256 {
         U256::MAX
+    }
+
+    /// Validates that this predicate's parameters are internally consistent.
+    ///
+    /// A storage predicate's comparison value must not set any bits outside its
+    /// mask, since the loaded value is masked before comparison.
+    pub fn validate(&self) -> Result<(), ValidityPredicateError> {
+        if let Self::Storage { mask, value, .. } = self
+            && (*value & !*mask) != U256::ZERO
+        {
+            return Err(ValidityPredicateError::StorageValueOutsideMask);
+        }
+        Ok(())
+    }
+
+    /// Validates a batch of predicates submitted at ingress.
+    ///
+    /// Rejects an empty batch, a batch larger than [`MAX_VALIDITY_PREDICATES`],
+    /// and any predicate whose parameters are internally inconsistent.
+    pub fn validate_batch(predicates: &[Self]) -> Result<(), ValidityPredicateError> {
+        if predicates.is_empty() {
+            return Err(ValidityPredicateError::Empty);
+        }
+        if predicates.len() > MAX_VALIDITY_PREDICATES {
+            return Err(ValidityPredicateError::TooMany {
+                count: predicates.len(),
+                max: MAX_VALIDITY_PREDICATES,
+            });
+        }
+        for predicate in predicates {
+            predicate.validate()?;
+        }
+        Ok(())
     }
 
     /// Returns whether this predicate holds against the current database state.
@@ -376,5 +434,101 @@ mod tests {
         let error = extension.apply(transaction).unwrap_err();
 
         assert!(error.to_string().contains("too many validity predicates"));
+    }
+
+    #[test]
+    fn validate_accepts_storage_value_within_mask() {
+        let predicate = ValidityPredicate::Storage {
+            address: Address::repeat_byte(0x11),
+            slot: U256::from(1),
+            mask: U256::from(0xff),
+            op: ValidityOperator::Equal,
+            value: U256::from(0xab),
+        };
+
+        assert_eq!(predicate.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_storage_value_outside_mask() {
+        let predicate = ValidityPredicate::Storage {
+            address: Address::repeat_byte(0x11),
+            slot: U256::from(1),
+            mask: U256::from(0xff),
+            op: ValidityOperator::Equal,
+            value: U256::from(0x1ff),
+        };
+
+        assert_eq!(predicate.validate(), Err(ValidityPredicateError::StorageValueOutsideMask));
+    }
+
+    #[test]
+    fn validate_ignores_mask_for_non_storage_predicates() {
+        let predicate = ValidityPredicate::Balance {
+            address: Address::repeat_byte(0x11),
+            op: ValidityOperator::Equal,
+            value: U256::MAX,
+        };
+
+        assert_eq!(predicate.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_batch_rejects_empty() {
+        assert_eq!(ValidityPredicate::validate_batch(&[]), Err(ValidityPredicateError::Empty));
+    }
+
+    #[test]
+    fn validate_batch_rejects_too_many() {
+        let predicate = ValidityPredicate::Balance {
+            address: Address::ZERO,
+            op: ValidityOperator::Equal,
+            value: U256::ZERO,
+        };
+        let predicates = vec![predicate; MAX_VALIDITY_PREDICATES + 1];
+
+        assert_eq!(
+            ValidityPredicate::validate_batch(&predicates),
+            Err(ValidityPredicateError::TooMany {
+                count: MAX_VALIDITY_PREDICATES + 1,
+                max: MAX_VALIDITY_PREDICATES,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_batch_accepts_valid_predicates() {
+        let predicates = vec![
+            ValidityPredicate::Balance {
+                address: Address::repeat_byte(0x11),
+                op: ValidityOperator::GreaterThanOrEqual,
+                value: U256::from(1),
+            },
+            ValidityPredicate::Storage {
+                address: Address::repeat_byte(0x22),
+                slot: U256::from(7),
+                mask: U256::from(0xff),
+                op: ValidityOperator::Equal,
+                value: U256::from(0xcd),
+            },
+        ];
+
+        assert_eq!(ValidityPredicate::validate_batch(&predicates), Ok(()));
+    }
+
+    #[test]
+    fn validate_batch_rejects_malformed_predicate() {
+        let predicates = vec![ValidityPredicate::Storage {
+            address: Address::repeat_byte(0x22),
+            slot: U256::from(7),
+            mask: U256::from(0xff),
+            op: ValidityOperator::Equal,
+            value: U256::from(0x100),
+        }];
+
+        assert_eq!(
+            ValidityPredicate::validate_batch(&predicates),
+            Err(ValidityPredicateError::StorageValueOutsideMask)
+        );
     }
 }

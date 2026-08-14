@@ -11,14 +11,18 @@ use base_consensus_cli::{
 };
 use base_execution_chainspec::BaseChainSpec;
 use base_execution_cli::{
-    ExecutionNodeConfigArgs, StandardBaseRethNode, chainspec::chain_value_parser,
+    ExecutionNodeConfigArgs, MeteringArgs, StandardBaseRethNode, chainspec::chain_value_parser,
 };
-use base_node_runner::BaseNodeRunner;
+use base_execution_payload_builder::{
+    MemoryMeteringStore, ResourceMeteringMode, config::ResourceMeteringConfig,
+};
+use base_node_runner::{BaseNodeRunner, PayloadServiceBuilder};
 use base_txpool_rpc::{TxPoolRpcConfig, TxPoolRpcExtension};
 use base_upgrade_signal::UpgradeSignalStartupMode;
 use clap::Args;
 use reth_cli_runner::CliRunner;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 use crate::{commands::rpc::engine_ipc_url, config::ResolvedChainConfig};
 
@@ -37,6 +41,10 @@ pub(crate) struct SequencerCommand {
     #[command(flatten)]
     pub(crate) builder: BuilderArgs,
 
+    /// Native payload resource metering by opcode.
+    #[command(flatten)]
+    pub(crate) metering: MeteringArgs,
+
     /// Embedded consensus sequencer arguments.
     #[command(flatten)]
     pub(crate) consensus: EmbeddedSequencerConsensusNodeConfigArgs,
@@ -49,7 +57,7 @@ impl SequencerCommand {
         resolved_chain: ResolvedChainConfig,
         metrics_enabled: bool,
     ) -> eyre::Result<()> {
-        let Self { execution_chain, execution, mut builder, consensus } = self;
+        let Self { execution_chain, execution, mut builder, consensus, metering } = self;
         let mut execution_chain = match execution_chain {
             Some(chain) => chain,
             None => resolved_chain.execution_chain_spec()?,
@@ -73,6 +81,13 @@ impl SequencerCommand {
         let da_config = builder_config.da_config.clone();
         let gas_limit_config = builder_config.gas_limit_config.clone();
         let manifest_precheck_enabled = builder_config.manifest_precheck_enabled;
+        let resource_metering_mode = ResourceMeteringMode::from(metering.resource_metering_mode);
+        let resource_metering = ResourceMeteringConfig::from_parts(
+            resource_metering_mode,
+            metering.resource_metering_schedule.as_deref(),
+            Arc::new(MemoryMeteringStore::new(resource_metering_mode.is_enabled())),
+        )?;
+        let use_native_payload_builder = resource_metering_mode.is_enabled();
 
         CliRunner::try_default_runtime()?.run_command_until_exit(|ctx| async move {
             rollup_args
@@ -100,20 +115,39 @@ impl SequencerCommand {
 
             let task_executor = ctx.task_executor.clone();
             let builder = execution.into_default_node_builder(ctx)?;
-            let mut runner = BaseNodeRunner::new(rollup_args.clone())
-                .with_da_config(da_config)
-                .with_gas_limit_config(gas_limit_config)
-                .with_manifest_precheck_enabled(manifest_precheck_enabled)
-                .with_service_builder(FlashblocksServiceBuilder::new(builder_config));
-            runner.install_ext::<MeteringStoreExtension>(metering_provider);
-            runner.install_ext::<TxPoolRpcExtension>(TxPoolRpcConfig { sequencer_rpc });
-            runner.install_ext::<BuilderApiExtension>(accept_validity_transactions);
-            StandardBaseRethNode::install_upgrade_signal_runtime_extension(
-                &mut runner,
-                &rollup_args,
-            )?;
-
-            let launched = runner.launch(builder).await?;
+            let launched = if use_native_payload_builder {
+                info!(
+                    target: "base-sequencer",
+                    mode = ?resource_metering_mode,
+                    "using native payload builder for resource metering by opcode"
+                );
+                let mut runner = BaseNodeRunner::new(rollup_args.clone())
+                    .with_da_config(da_config)
+                    .with_gas_limit_config(gas_limit_config)
+                    .with_manifest_precheck_enabled(manifest_precheck_enabled)
+                    .with_resource_metering(resource_metering);
+                install_sequencer_extensions(
+                    &mut runner,
+                    sequencer_rpc,
+                    accept_validity_transactions,
+                    &rollup_args,
+                )?;
+                runner.launch(builder).await?
+            } else {
+                let mut runner = BaseNodeRunner::new(rollup_args.clone())
+                    .with_da_config(da_config)
+                    .with_gas_limit_config(gas_limit_config)
+                    .with_manifest_precheck_enabled(manifest_precheck_enabled)
+                    .with_service_builder(FlashblocksServiceBuilder::new(builder_config));
+                runner.install_ext::<MeteringStoreExtension>(metering_provider);
+                install_sequencer_extensions(
+                    &mut runner,
+                    sequencer_rpc,
+                    accept_validity_transactions,
+                    &rollup_args,
+                )?;
+                runner.launch(builder).await?
+            };
             let handle = launched.handle;
             // Keep the execution node handle alive until both services have coordinated shutdown.
             let execution_node = handle.node;
@@ -156,6 +190,17 @@ impl SequencerCommand {
             result
         })
     }
+}
+
+fn install_sequencer_extensions<SB: PayloadServiceBuilder>(
+    runner: &mut BaseNodeRunner<SB>,
+    sequencer_rpc: Option<String>,
+    accept_validity_transactions: bool,
+    rollup_args: &base_node_core::args::RollupArgs,
+) -> eyre::Result<()> {
+    runner.install_ext::<TxPoolRpcExtension>(TxPoolRpcConfig { sequencer_rpc });
+    runner.install_ext::<BuilderApiExtension>(accept_validity_transactions);
+    StandardBaseRethNode::install_upgrade_signal_runtime_extension(runner, rollup_args)
 }
 
 #[cfg(test)]

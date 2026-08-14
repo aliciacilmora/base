@@ -14,7 +14,7 @@ use base_execution_cli::{
     ExecutionNodeConfigArgs, MeteringArgs, StandardBaseRethNode, chainspec::chain_value_parser,
 };
 use base_execution_payload_builder::{
-    MemoryMeteringStore, ResourceMeteringMode, config::ResourceMeteringConfig,
+    MemoryMeteringStore, ResourceThrottlingMode, config::ResourceMeteringConfig,
 };
 use base_node_runner::{BaseNodeRunner, PayloadServiceBuilder};
 use base_txpool_rpc::{TxPoolRpcConfig, TxPoolRpcExtension};
@@ -81,13 +81,14 @@ impl SequencerCommand {
         let da_config = builder_config.da_config.clone();
         let gas_limit_config = builder_config.gas_limit_config.clone();
         let manifest_precheck_enabled = builder_config.manifest_precheck_enabled;
-        let resource_metering_mode = ResourceMeteringMode::from(metering.resource_metering_mode);
+        let resource_throttling_mode =
+            ResourceThrottlingMode::from(metering.resource_throttling_mode);
         let resource_metering = ResourceMeteringConfig::from_parts(
-            resource_metering_mode,
+            resource_throttling_mode,
             metering.resource_metering_schedule.as_deref(),
-            Arc::new(MemoryMeteringStore::new(resource_metering_mode.is_enabled())),
+            Arc::new(MemoryMeteringStore::new(resource_throttling_mode.is_enabled())),
         )?;
-        let use_native_payload_builder = resource_metering_mode.is_enabled();
+        let use_native_payload_builder = resource_throttling_mode.is_enabled();
 
         CliRunner::try_default_runtime()?.run_command_until_exit(|ctx| async move {
             rollup_args
@@ -118,7 +119,7 @@ impl SequencerCommand {
             let launched = if use_native_payload_builder {
                 info!(
                     target: "base-sequencer",
-                    mode = ?resource_metering_mode,
+                    throttling_mode = ?resource_throttling_mode,
                     "using native payload builder for resource metering by opcode"
                 );
                 let mut runner = BaseNodeRunner::new(rollup_args.clone())

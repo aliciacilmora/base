@@ -42,7 +42,7 @@ use revm::context::{Block, BlockEnv};
 use tracing::{debug, debug_span, instrument, trace, warn};
 
 use crate::{
-    Attributes, BasePayloadBuilderAttributes, PayloadPrimitives, ResourceMeteringDecision,
+    Attributes, BasePayloadBuilderAttributes, PayloadPrimitives, ResourceThrottlingDecision,
     ResourceMeteringMetrics, config::BaseBuilderConfig, error::BasePayloadBuilderError,
     evaluate_transaction, payload::BaseBuiltPayload,
 };
@@ -763,7 +763,7 @@ where
         let resource_metering = &self.builder_config.resource_metering;
         let resource_schedule = resource_metering.store.snapshot();
         let resource_metering_active =
-            resource_metering.mode.is_enabled() && !resource_schedule.is_empty();
+            resource_metering.throttling_mode.is_enabled() && !resource_schedule.is_empty();
         while let Some(tx) = best_txs.next(()) {
             if self.builder_config.manifest_precheck_enabled
                 && let Some(manifest) = tx.watch_manifest()
@@ -825,12 +825,12 @@ where
                     &tx_hash,
                     &info.resource_metering_usage,
                 ) {
-                    ResourceMeteringDecision::Inactive => {}
-                    ResourceMeteringDecision::Allow(usage) => {
+                    ResourceThrottlingDecision::Inactive => {}
+                    ResourceThrottlingDecision::Allow(usage) => {
                         pending_resource_usage = Some(usage);
                     }
-                    ResourceMeteringDecision::Reject { error, usage } => {
-                        let enforced = !resource_metering.mode.is_dry_run();
+                    ResourceThrottlingDecision::Throttle { error, usage } => {
+                        let enforced = !resource_metering.throttling_mode.is_dry_run();
                         ResourceMeteringMetrics::record_limit(&error, enforced);
                         warn!(
                             target: "payload_builder",
@@ -840,7 +840,7 @@ where
                             used = error.used,
                             limit = error.limit,
                             dry_run = !enforced,
-                            "resource metering budget exceeded"
+                            "resource throttling budget exceeded"
                         );
                         if enforced {
                             best_txs.mark_invalid(tx.sender(), tx.nonce());
@@ -848,7 +848,7 @@ where
                         }
                         pending_resource_usage = Some(usage);
                     }
-                    ResourceMeteringDecision::CalculationFailed => {
+                    ResourceThrottlingDecision::CalculationFailed => {
                         ResourceMeteringMetrics::calculation_failed().increment(1);
                         warn!(
                             target: "payload_builder",

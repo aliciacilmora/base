@@ -31,10 +31,8 @@ reth-revm = { workspace = true, features = ["witness"] }
 reth-trie-common.workspace = true
 
 # op-reth
-base-protocol.workspace = true
 base-common-evm.workspace = true
 base-execution-evm.workspace = true
-base-common-genesis.workspace = true
 base-execution-txpool.workspace = true
 base-execution-eip8130.workspace = true
 
@@ -51,10 +49,6 @@ alloy-rpc-types-engine.workspace = true
 base-common-consensus = { workspace = true, features = ["reth"] }
 base-common-rpc-types-engine = { workspace = true, features = ["serde", "reth"] }
 
-# metrics
-base-metrics.workspace = true
-metrics = { workspace = true, optional = true }
-
 # misc
 serde.workspace = true
 tracing.workspace = true
@@ -66,7 +60,3 @@ reth-provider.workspace = true
 reth-ethereum-forks.workspace = true
 base-execution-chainspec.workspace = true
 reth-revm = { workspace = true, features = ["test-utils"] }
-
-[features]
-default = [ "metrics" ]
-metrics = [ "base-metrics/metrics", "dep:metrics" ]

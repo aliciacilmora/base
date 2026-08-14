@@ -1143,7 +1143,6 @@ where
                     da_config: self.da_config,
                     gas_limit_config: self.gas_limit_config,
                     manifest_precheck_enabled: self.manifest_precheck_enabled,
-                    ..Default::default()
                 },
             )
             .with_transactions(self.best_transactions);

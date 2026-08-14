@@ -1,11 +1,6 @@
 //! Additional configuration for the Base payload builder.
 
-use std::{
-    sync::{Arc, atomic::AtomicU64},
-    time::Duration,
-};
-
-use base_common_genesis::RollupConfig;
+use std::sync::{Arc, atomic::AtomicU64};
 
 /// Settings for the Base payload builder.
 #[derive(Debug, Clone)]
@@ -17,8 +12,6 @@ pub struct BaseBuilderConfig {
     /// Whether to drop positively stale EIP-8130 transactions using their
     /// captured authorization manifest before execution.
     pub manifest_precheck_enabled: bool,
-    /// Offset into a Denim slot at which the builder stops selecting pool transactions.
-    pub seal_offset: Duration,
 }
 
 impl Default for BaseBuilderConfig {
@@ -27,7 +20,6 @@ impl Default for BaseBuilderConfig {
             da_config: BaseDAConfig::default(),
             gas_limit_config: GasLimitConfig::default(),
             manifest_precheck_enabled: true,
-            seal_offset: Duration::from_millis(RollupConfig::DEFAULT_SEAL_OFFSET_MILLIS),
         }
     }
 }
@@ -39,12 +31,7 @@ impl BaseBuilderConfig {
         gas_limit_config: GasLimitConfig,
         manifest_precheck_enabled: bool,
     ) -> Self {
-        Self {
-            da_config,
-            gas_limit_config,
-            manifest_precheck_enabled,
-            seal_offset: Duration::from_millis(RollupConfig::DEFAULT_SEAL_OFFSET_MILLIS),
-        }
+        Self { da_config, gas_limit_config, manifest_precheck_enabled }
     }
 
     /// Returns the data availability configuration for the Base payload builder, if it has

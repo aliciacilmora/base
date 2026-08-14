@@ -94,12 +94,12 @@ pub enum ApplyError {
     /// an ungated actor, or not exactly `manager(20) || commitment(32)` for a
     /// gated actor). Mirrors `_slicePolicy`.
     #[error("policy data does not match policy type")]
-    MalformedPolicyData,
+    InvalidPolicyData,
 
     /// Revoking an actor that is not currently authorized. Mirrors
     /// `_revokeActor`'s `require(isActor(...))`.
     #[error("actor {actor_id} is not authorized and cannot be revoked")]
-    NotAnActor {
+    UnknownActor {
         /// The actor id that was not an authorized actor.
         actor_id: B256,
     },
@@ -130,7 +130,7 @@ pub enum ApplyError {
     /// The account targeted by a create entry already has EIP-8130 state. Mirrors
     /// the CREATE2 collision that makes `createAccount` unrepeatable.
     #[error("account {account} is already created")]
-    AlreadyCreated {
+    AlreadyInitialized {
         /// The counterfactual address that already holds state.
         account: Address,
     },
@@ -623,7 +623,7 @@ impl AccountChangeApplier {
             return Ok(0);
         }
         if !is_self || state.default_eoa_revoked() {
-            return Err(ApplyError::NotAnActor { actor_id });
+            return Err(ApplyError::UnknownActor { actor_id });
         }
 
         // The inline self's `actor_config` slot is always empty (a zero-to-zero
@@ -663,7 +663,7 @@ impl AccountChangeApplier {
         config: ActorConfig,
     ) -> Result<(), ApplyError> {
         if config.authenticator == Address::ZERO {
-            return Err(ApplyError::NotAnActor { actor_id });
+            return Err(ApplyError::UnknownActor { actor_id });
         }
         storage.clear_actor_config(account, actor_id)?;
         storage.clear_policy(account, actor_id)?;
@@ -687,7 +687,7 @@ impl AccountChangeApplier {
         // on a duplicate initial actor (mirrors `createAccount`'s guard).
         let mut state = storage.get_account_state(address)?;
         if state.local_sequence != 0 || state.multichain_sequence != 0 {
-            return Err(ApplyError::AlreadyCreated { account: address });
+            return Err(ApplyError::AlreadyInitialized { account: address });
         }
 
         // Mark initialized, disable the implicit default-EOA path by default
@@ -776,12 +776,12 @@ impl AccountChangeApplier {
     pub fn slice_policy(scope: u16, policy_data: &[u8]) -> Result<(Address, B256), ApplyError> {
         if scope & Eip8130Constants::SCOPE_POLICY == 0 {
             if !policy_data.is_empty() {
-                return Err(ApplyError::MalformedPolicyData);
+                return Err(ApplyError::InvalidPolicyData);
             }
             return Ok((Address::ZERO, B256::ZERO));
         }
         if policy_data.len() != Eip8130Constants::POLICY_DATA_LEN {
-            return Err(ApplyError::MalformedPolicyData);
+            return Err(ApplyError::InvalidPolicyData);
         }
         let manager = Address::from_slice(&policy_data[..20]);
         let commitment = B256::from_slice(&policy_data[20..Eip8130Constants::POLICY_DATA_LEN]);
@@ -943,7 +943,7 @@ mod tests {
         );
         assert_eq!(
             AccountChangeApplier::slice_policy(0, &[1]),
-            Err(ApplyError::MalformedPolicyData)
+            Err(ApplyError::InvalidPolicyData)
         );
 
         let mut data = Vec::new();
@@ -957,7 +957,7 @@ mod tests {
         // Wrong length rejects.
         assert_eq!(
             AccountChangeApplier::slice_policy(Eip8130Constants::SCOPE_POLICY, &data[..51]),
-            Err(ApplyError::MalformedPolicyData)
+            Err(ApplyError::InvalidPolicyData)
         );
         // Per the frozen rule, neither field need be nonzero: a zero
         // manager/commitment is well-formed (`manager(20) || commitment(32)`).
@@ -986,7 +986,7 @@ mod tests {
             assert!(acc.actor_config_slot(ACCOUNT, NON_SELF).unwrap().is_empty());
             assert_eq!(
                 AccountChangeApplier::revoke_actor(acc, ACCOUNT, NON_SELF),
-                Err(ApplyError::NotAnActor { actor_id: NON_SELF })
+                Err(ApplyError::UnknownActor { actor_id: NON_SELF })
             );
         });
     }
@@ -1013,7 +1013,7 @@ mod tests {
             let unrestricted = ActorConfig { authenticator: AUTHENTICATOR, scope: 0, expiry: 0 };
             assert_eq!(
                 AccountChangeApplier::authorize_actor(acc, ACCOUNT, NON_SELF, unrestricted, &data),
-                Err(ApplyError::MalformedPolicyData)
+                Err(ApplyError::InvalidPolicyData)
             );
 
             // SCOPE_POLICY actor accepted; policy slots written.
@@ -1421,7 +1421,7 @@ mod tests {
             // Re-creating the same account is rejected.
             assert_eq!(
                 AccountChangeApplier::apply_create(acc, &entry),
-                Err(ApplyError::AlreadyCreated { account: expected })
+                Err(ApplyError::AlreadyInitialized { account: expected })
             );
         });
     }
@@ -1452,7 +1452,7 @@ mod tests {
             // create must still reject (the guard checks both sequences).
             assert_eq!(
                 AccountChangeApplier::apply_create(acc, &entry),
-                Err(ApplyError::AlreadyCreated { account: expected })
+                Err(ApplyError::AlreadyInitialized { account: expected })
             );
         });
     }

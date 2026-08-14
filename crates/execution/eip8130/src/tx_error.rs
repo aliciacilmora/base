@@ -35,10 +35,10 @@ pub enum TxAuthError {
     },
 
     /// A config change or delegation targets a locked account. Both operations
-    /// are rejected while locked. Mirrors `AccountConfiguration`'s
-    /// `onlyUnlocked` modifier.
+    /// are rejected while locked. Mirrors `Keystore.AccountIsLocked` (the
+    /// `onlyUnlocked` modifier).
     #[error("account is locked")]
-    AccountLocked,
+    AccountIsLocked,
 
     /// A delegation was not authorized by an admin (unrestricted) actor on the
     /// unlocked account.
@@ -46,9 +46,10 @@ pub enum TxAuthError {
     DelegationUnauthorized,
 
     /// A config change is bound to a chain other than `0` (multichain) or the
-    /// local chain. Mirrors `require(chainId == 0 || chainId == block.chainid)`.
+    /// local chain. Mirrors `Keystore.InvalidChainId`
+    /// (`require(chainId == 0 || chainId == block.chainid)`).
     #[error("config change chain id {got} is neither 0 nor the local chain {expected}")]
-    ConfigChainId {
+    InvalidChainId {
         /// The local chain id.
         expected: u64,
         /// The chain id carried by the config change.
@@ -61,7 +62,7 @@ pub enum TxAuthError {
     /// signed digest would not match the value that will actually be applied).
     /// Mirrors `Keystore.BadSequence`.
     #[error("config change sequence {got} does not match the expected {expected}")]
-    ConfigSequence {
+    BadSequence {
         /// The sequence read from the account's state for the batch's channel.
         expected: u64,
         /// The sequence carried by the signed account-change batch.

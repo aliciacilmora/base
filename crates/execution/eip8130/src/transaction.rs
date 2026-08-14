@@ -222,7 +222,7 @@ impl TransactionAuthorizer {
         sender: &AuthorizedActor,
     ) -> Result<(), TxAuthError> {
         if storage.is_locked(sender.account, now).map_err(AuthorizeError::Storage)? {
-            return Err(TxAuthError::AccountLocked);
+            return Err(TxAuthError::AccountIsLocked);
         }
 
         if !sender.resolved.is_admin() {
@@ -419,7 +419,7 @@ mod tests {
         with_storage(|acc| {
             assert_eq!(
                 TransactionAuthorizer::authorize_and_apply(&signed, acc, LOCAL, NOW),
-                Err(TxAuthError::ConfigSequence { expected: 1, got: 0 }),
+                Err(TxAuthError::BadSequence { expected: 1, got: 0 }),
             );
         });
     }
@@ -626,7 +626,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 TransactionAuthorizer::authorize_and_apply(&signed, acc, LOCAL, NOW),
-                Err(TxAuthError::AccountLocked),
+                Err(TxAuthError::AccountIsLocked),
             );
         });
     }
@@ -953,7 +953,7 @@ mod tests {
     fn counterfactual_create_authorizes_on_empty_account() {
         // A counterfactual smart-account CREATE must succeed even though the
         // account does not yet exist in storage (actor_config is empty). Before
-        // the fix this returned `NotBound` because `resolve_bound` ran against
+        // the fix this returned `AuthenticatorMismatch` because `resolve_bound` ran against
         // an empty account before `apply_create` could install `initial_actors`.
         let k = key(0xc1);
         let (derived, signed) = create_tx_and_signed(&k, vec![]);
@@ -1079,7 +1079,7 @@ mod tests {
             assert!(
                 matches!(
                     TransactionAuthorizer::authorize_and_apply(&signed, acc, LOCAL, NOW),
-                    Err(TxAuthError::Authorize(AuthorizeError::NotBound { .. }))
+                    Err(TxAuthError::Authorize(AuthorizeError::AuthenticatorMismatch { .. }))
                 ),
                 "signer not in initial_actors must be rejected"
             );

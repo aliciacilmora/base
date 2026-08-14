@@ -214,13 +214,13 @@ impl<Pool: TransactionPool + 'static> AdminTxPoolApiServer for AdminTxPoolApiImp
 #[cfg(test)]
 mod tests {
     use alloy_primitives::U256;
+    use base_execution_txpool::MAX_VALIDITY_PREDICATES;
     use httpmock::prelude::*;
     use reth_transaction_pool::{
         PoolTransaction, TransactionOrigin,
         noop::NoopTransactionPool,
         test_utils::{MockTransaction, testing_pool},
     };
-    use base_execution_txpool::MAX_VALIDITY_PREDICATES;
     use serde_json::{self, json};
 
     use super::*;

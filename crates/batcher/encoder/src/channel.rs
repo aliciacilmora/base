@@ -110,11 +110,18 @@ impl SpanChannel {
     /// [`OpenChannel::add_block`] calls this from the encoder's `step` transition.
     /// The returned [`ChannelAddOutcome`] tells the caller whether to advance the
     /// block cursor, close the channel, or retry the block in a fresh channel.
+    /// A [`ChannelAddOutcome::Rejected`] result makes this channel terminal:
+    /// the caller must close it rather than call `add_block` again.
     pub fn add_block(
         &mut self,
         batch: SingleBatch,
         sequence_number: u64,
     ) -> Result<ChannelAddOutcome, OpenChannelError> {
+        debug_assert!(
+            self.candidate_rlp.len() <= self.accepted_rlp.len(),
+            "cannot append to a SpanChannel after rejection"
+        );
+
         // A span at the configured block limit is already represented by
         // `accepted_rlp`; seal it before building the next candidate span.
         if self.max_blocks_per_span_batch.is_some_and(|max| self.active_span.batches.len() == max) {

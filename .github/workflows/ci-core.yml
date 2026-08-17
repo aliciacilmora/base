@@ -110,7 +110,7 @@ jobs:
   build:
     name: Build
     runs-on:
-      group: BasePerfRunnerGroup
+      group: ubuntu-latest
     env:
       BASE_REF: ${{ inputs.base_ref }}
     steps:

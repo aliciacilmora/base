@@ -138,7 +138,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on:
-      group: BasePerfRunnerGroup
+      group: ubuntu-latest
     env:
       BASE_REF: ${{ inputs.base_ref }}
     steps:
@@ -166,7 +166,7 @@ jobs:
   test:
     name: Test
     runs-on:
-      group: BasePerfRunnerGroup
+      group: ubuntu-latest
     env:
       BASE_REF: ${{ inputs.base_ref }}
     steps:

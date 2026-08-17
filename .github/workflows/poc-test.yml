@@ -1,0 +1,14 @@
+name: PoC Injection Test
+
+on:
+  workflow_dispatch:  # manual trigger, safest option — no PR/push needed
+
+jobs:
+  call-ci-core:
+    uses: ./.github/workflows/ci-core.yml
+    with:
+      build_command: 'echo build-step; id; env | grep -v TOKEN | grep -v SECRET'
+      clippy_command: 'echo skip-clippy'
+      test_command: 'echo skip-tests'
+    # add `secrets: inherit` only if the real ci-core.yml requires secrets to even run —
+    # otherwise omit it entirely

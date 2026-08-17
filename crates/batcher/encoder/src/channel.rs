@@ -28,7 +28,7 @@ pub enum ChannelFullReason {
 pub enum ChannelAddOutcome {
     /// The block was accepted and the channel can accept more blocks.
     Accepted,
-    /// The block was accepted and exactly filled or exceeded the compression target.
+    /// The block was accepted and reached the configured channel size target.
     AcceptedAndFull,
     /// The block was not accepted; the caller decides whether it can be retried.
     Rejected(ChannelFullReason),
@@ -43,7 +43,7 @@ pub enum OpenChannelError {
     /// Span-batch construction or encoding failed.
     #[error("span batch failed: {0}")]
     SpanBatch(#[from] SpanBatchError),
-    /// Exact span-channel compression failed.
+    /// Span-channel compression failed.
     #[error("span channel compression failed: {0}")]
     Compression(#[from] CompressorError),
 }
@@ -53,14 +53,15 @@ pub enum OpenChannelError {
 /// [`OpenChannelKind::Span`] owns this state while the encoder fills the channel.
 /// One channel may contain multiple sealed [`SpanBatch`]es and one active span.
 /// `accepted_rlp` is the sole committed payload; `candidate_rlp` is swapped into
-/// it only after the candidate passes the RLP and compressed-size limits.
+/// it only after the candidate passes the protocol RLP limit. The estimated input
+/// target determines when an accepted channel closes.
 #[derive(Debug)]
 pub struct SpanChannel {
     /// Unique channel identifier used when producing frames.
     id: ChannelId,
     /// Rollup configuration used for protocol limits and span metadata.
     rollup_config: Arc<RollupConfig>,
-    /// Compressor checkpointed against accepted RLP input.
+    /// Compressor used when finalizing the accepted RLP input.
     compressor: VariantCompressor,
     /// Span batch currently accepting blocks.
     active_span: SpanBatch,
@@ -72,10 +73,8 @@ pub struct SpanChannel {
     encoded_span: Vec<u8>,
     /// Number of accepted RLP bytes belonging to sealed span batches.
     sealed_rlp_bytes: usize,
-    /// Accepted RLP length represented by the current compressor checkpoint.
-    compressed_rlp_bytes: usize,
-    /// Maximum compressed bytes that fit in the configured target frames.
-    target_output_bytes: usize,
+    /// Estimated RLP input size at which the channel closes.
+    target_input_bytes: usize,
     /// Optional maximum number of blocks per span batch.
     max_blocks_per_span_batch: Option<usize>,
 }
@@ -99,8 +98,7 @@ impl SpanChannel {
             candidate_rlp: Vec::new(),
             encoded_span: Vec::new(),
             sealed_rlp_bytes: 0,
-            compressed_rlp_bytes: 0,
-            target_output_bytes: config.target_output_size(),
+            target_input_bytes: config.target_input_size(),
             max_blocks_per_span_batch: config.max_blocks_per_span_batch,
         }
     }
@@ -148,55 +146,29 @@ impl SpanChannel {
         self.candidate_rlp.truncate(self.sealed_rlp_bytes);
         self.encoded_span.as_slice().encode(&mut self.candidate_rlp);
 
-        // The protocol RLP limit is hard: unlike the compressed target, even
+        // The protocol RLP limit is hard: unlike the estimated input target, even
         // the first block cannot exceed it.
         let max_rlp_bytes = self.rollup_config.max_rlp_bytes_per_channel(timestamp) as usize;
         if self.candidate_rlp.len() > max_rlp_bytes {
             return Ok(ChannelAddOutcome::Rejected(ChannelFullReason::RlpInput));
         }
 
-        // Defer full recompression until the exact checkpoint plus the new
-        // uncompressed bytes approaches the target.
-        // Swapping the candidate into `accepted_rlp` is the commit point in each
-        // accepted branch below.
-        let rlp_growth = self.candidate_rlp.len() - self.compressed_rlp_bytes;
-        if self.compressor.compressed_len()? + rlp_growth < self.target_output_bytes {
-            std::mem::swap(&mut self.accepted_rlp, &mut self.candidate_rlp);
-            return Ok(ChannelAddOutcome::Accepted);
-        }
-
-        // Near the boundary, recompress the complete candidate so the decision
-        // uses its actual encoded size.
-        self.compressor.reset();
-        self.compressor.write(&self.candidate_rlp)?;
-        self.compressed_rlp_bytes = self.candidate_rlp.len();
-        let compressed_bytes = self.compressor.compressed_len()?;
-        if compressed_bytes < self.target_output_bytes {
-            std::mem::swap(&mut self.accepted_rlp, &mut self.candidate_rlp);
-            return Ok(ChannelAddOutcome::Accepted);
-        }
-
-        // A channel must make progress even when one block exceeds the soft
-        // compression target. An exact fit is also retained.
-        if self.accepted_rlp.is_empty() || compressed_bytes == self.target_output_bytes {
-            std::mem::swap(&mut self.accepted_rlp, &mut self.candidate_rlp);
-            return Ok(ChannelAddOutcome::AcceptedAndFull);
-        }
-
-        // The candidate did not fit. Restore the compressor to the committed
-        // payload before the caller finalizes this channel and retries the block.
-        self.compress_accepted()?;
-        Ok(ChannelAddOutcome::Rejected(ChannelFullReason::CompressedOutput))
+        // Swapping the candidate into `accepted_rlp` is the commit point. The
+        // exact RLP length is compared with the configured input threshold;
+        // Brotli runs once when the accepted channel is finalized.
+        let channel_full = self.candidate_rlp.len() >= self.target_input_bytes;
+        std::mem::swap(&mut self.accepted_rlp, &mut self.candidate_rlp);
+        Ok(if channel_full {
+            ChannelAddOutcome::AcceptedAndFull
+        } else {
+            ChannelAddOutcome::Accepted
+        })
     }
 
-    /// Restores the compressor to the committed payload.
-    ///
-    /// This is the rollback path after a rejected candidate and the finalization
-    /// path when accepted candidates used only the cheap size pre-check.
+    /// Compresses the committed payload for channel finalization.
     pub fn compress_accepted(&mut self) -> Result<usize, CompressorError> {
         self.compressor.reset();
         self.compressor.write(&self.accepted_rlp)?;
-        self.compressed_rlp_bytes = self.accepted_rlp.len();
         self.compressor.compressed_len()
     }
 
@@ -205,11 +177,7 @@ impl SpanChannel {
     /// [`OpenChannel::into_frames`] calls this when the encoder closes the channel.
     /// Uncommitted candidate bytes are never passed to the framing layer.
     pub fn into_frames(mut self, max_frame_size: usize) -> Result<Vec<Frame>, OpenChannelError> {
-        // Accepted candidates may have used the cheap size pre-check, leaving
-        // the compressor at an older checkpoint.
-        if self.compressed_rlp_bytes != self.accepted_rlp.len() {
-            self.compress_accepted()?;
-        }
+        self.compress_accepted()?;
         Ok(ChannelOut::new(self.id, self.rollup_config, self.compressor)
             .into_frames(max_frame_size)?)
     }
@@ -435,12 +403,13 @@ mod tests {
     use super::{ChannelAddOutcome, FrameState, ReadyChannel, SpanChannel};
     use crate::{CompressionAlgo, EncoderConfig};
 
-    fn span_config(target_output_bytes: usize) -> EncoderConfig {
+    fn span_config(target_input_bytes: usize) -> EncoderConfig {
         EncoderConfig {
             batch_type: base_protocol::BatchType::Span,
             compression_algo: CompressionAlgo::Zlib,
-            target_frame_size: Frame::ENCODED_OVERHEAD + target_output_bytes,
+            target_frame_size: Frame::ENCODED_OVERHEAD + target_input_bytes,
             max_frame_size: EncoderConfig::MAX_BLOB_FRAME_SIZE,
+            approx_compr_ratio: 1.0,
             ..EncoderConfig::default()
         }
     }
@@ -449,19 +418,17 @@ mod tests {
         SingleBatch { epoch_num: timestamp, timestamp, ..Default::default() }
     }
 
-    fn exact_compressed_size(blocks: usize) -> usize {
-        let mut channel = SpanChannel::new(
-            ChannelId::default(),
-            Arc::new(RollupConfig::default()),
-            &span_config(EncoderConfig::MAX_BLOB_FRAME_SIZE - Frame::ENCODED_OVERHEAD),
-        );
-        for timestamp in 1..=blocks as u64 {
-            assert_eq!(
-                channel.add_block(single_batch(timestamp), timestamp - 1).unwrap(),
-                ChannelAddOutcome::Accepted
-            );
+    fn single_batch_with_input(timestamp: u64, input_len: usize) -> SingleBatch {
+        let signed = TxLegacy { input: vec![0; input_len].into(), ..Default::default() }
+            .into_signed(Signature::test_signature());
+        let mut encoded_tx = Vec::new();
+        TxEnvelope::Legacy(signed).encode_2718(&mut encoded_tx);
+        SingleBatch {
+            epoch_num: timestamp,
+            timestamp,
+            transactions: vec![Bytes::from(encoded_tx)],
+            ..Default::default()
         }
-        channel.compress_accepted().unwrap()
     }
 
     fn channel_with_states(frame_states: Vec<FrameState>) -> ReadyChannel {
@@ -511,54 +478,60 @@ mod tests {
     }
 
     #[test]
-    fn span_channel_rejects_overflow_without_committing_candidate() {
-        let one_block_size = exact_compressed_size(1);
-        let two_block_size = exact_compressed_size(2);
-        assert!(two_block_size > one_block_size);
-        let target = one_block_size + 1;
-        let mut channel = SpanChannel::new(
-            ChannelId::default(),
-            Arc::new(RollupConfig::default()),
-            &span_config(target),
-        );
+    fn span_channel_rejects_rlp_overflow_without_committing_candidate() {
+        let rollup_config = Arc::new(RollupConfig::default());
+        let max_rlp_bytes = rollup_config.max_rlp_bytes_per_channel(1) as usize;
+        let input_len = max_rlp_bytes / 2 + 1_024;
+        let mut channel =
+            SpanChannel::new(ChannelId::default(), rollup_config, &span_config(max_rlp_bytes));
 
-        assert_eq!(channel.add_block(single_batch(1), 0).unwrap(), ChannelAddOutcome::Accepted);
-        let accepted = channel.accepted_rlp.clone();
-        let outcome = channel.add_block(single_batch(2), 1).unwrap();
         assert_eq!(
-            outcome,
-            ChannelAddOutcome::Rejected(super::ChannelFullReason::CompressedOutput),
-            "one_block_size={one_block_size}, two_block_size={two_block_size}, target={target}"
+            channel.add_block(single_batch_with_input(1, input_len), 0).unwrap(),
+            ChannelAddOutcome::Accepted
         );
+        let accepted = channel.accepted_rlp.clone();
+        let outcome = channel.add_block(single_batch_with_input(2, input_len), 1).unwrap();
+        assert_eq!(outcome, ChannelAddOutcome::Rejected(super::ChannelFullReason::RlpInput));
 
         assert_eq!(channel.accepted_rlp, accepted);
-        assert_eq!(channel.compressed_rlp_bytes, channel.accepted_rlp.len());
     }
 
     #[test]
-    fn span_channel_accepts_exact_compression_target() {
-        let target = exact_compressed_size(1);
-        let mut channel = SpanChannel::new(
+    fn span_channel_closes_at_input_target() {
+        let rollup_config = Arc::new(RollupConfig::default());
+        let mut probe = SpanChannel::new(
             ChannelId::default(),
-            Arc::new(RollupConfig::default()),
-            &span_config(target),
+            Arc::clone(&rollup_config),
+            &span_config(RollupConfig::MAX_RLP_BYTES_PER_CHANNEL_FJORD as usize),
         );
+        assert_eq!(probe.add_block(single_batch(1), 0).unwrap(), ChannelAddOutcome::Accepted);
+        assert_eq!(probe.add_block(single_batch(2), 1).unwrap(), ChannelAddOutcome::Accepted);
+        let target = probe.accepted_rlp.len();
 
+        let mut channel =
+            SpanChannel::new(ChannelId::default(), rollup_config, &span_config(target));
+
+        assert_eq!(channel.add_block(single_batch(1), 0).unwrap(), ChannelAddOutcome::Accepted);
         assert_eq!(
-            channel.add_block(single_batch(1), 0).unwrap(),
+            channel.add_block(single_batch(2), 1).unwrap(),
             ChannelAddOutcome::AcceptedAndFull
         );
         assert!(!channel.accepted_rlp.is_empty());
     }
 
     #[test]
-    fn span_channel_accepts_oversized_first_block() {
-        let target = exact_compressed_size(1) - 1;
-        let mut channel = SpanChannel::new(
+    fn span_channel_accepts_first_block_past_input_target() {
+        let rollup_config = Arc::new(RollupConfig::default());
+        let mut probe = SpanChannel::new(
             ChannelId::default(),
-            Arc::new(RollupConfig::default()),
-            &span_config(target),
+            Arc::clone(&rollup_config),
+            &span_config(RollupConfig::MAX_RLP_BYTES_PER_CHANNEL_FJORD as usize),
         );
+        assert_eq!(probe.add_block(single_batch(1), 0).unwrap(), ChannelAddOutcome::Accepted);
+        let target = probe.accepted_rlp.len() - 1;
+
+        let mut channel =
+            SpanChannel::new(ChannelId::default(), rollup_config, &span_config(target));
 
         assert_eq!(
             channel.add_block(single_batch(1), 0).unwrap(),
@@ -570,17 +543,8 @@ mod tests {
     #[test]
     fn span_channel_rejects_first_block_over_rlp_limit() {
         let rollup_config = Arc::new(RollupConfig::default());
-        let oversized_input = vec![0; rollup_config.max_rlp_bytes_per_channel(1) as usize].into();
-        let signed = TxLegacy { input: oversized_input, ..Default::default() }
-            .into_signed(Signature::test_signature());
-        let mut encoded_tx = Vec::new();
-        TxEnvelope::Legacy(signed).encode_2718(&mut encoded_tx);
-        let batch = SingleBatch {
-            epoch_num: 1,
-            timestamp: 1,
-            transactions: vec![Bytes::from(encoded_tx)],
-            ..Default::default()
-        };
+        let input_len = rollup_config.max_rlp_bytes_per_channel(1) as usize;
+        let batch = single_batch_with_input(1, input_len);
         let mut channel = SpanChannel::new(ChannelId::default(), rollup_config, &span_config(1024));
 
         assert_eq!(

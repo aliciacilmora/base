@@ -155,6 +155,12 @@ pub(crate) struct BatcherArgs {
     )]
     da_type: base_batcher_encoder::DaType,
 
+    /// Approximate compression ratio used for Span channel sizing.
+    ///
+    /// Only relevant with `--batch-type=span`.
+    #[arg(long = "approx-compr-ratio", default_value = "0.6", env = "BATCHER_APPROX_COMPR_RATIO")]
+    pub approx_compr_ratio: f64,
+
     /// Maximum number of in-flight (unconfirmed) transactions.
     #[arg(
         long = "max-pending-transactions",
@@ -294,6 +300,7 @@ impl BatcherArgs {
             max_channel_duration: self.max_channel_duration,
             sub_safety_margin: self.sub_safety_margin,
             target_num_frames: self.target_num_frames,
+            approx_compr_ratio: self.approx_compr_ratio,
             max_blocks_per_span_batch: self.max_blocks_per_span_batch,
             batch_type: self.batch_type.into(),
             da_type: self.da_type,
@@ -484,6 +491,30 @@ mod tests {
         let config = cli.args.into_config().expect("config should build");
 
         assert_eq!(config.encoder_config.max_blocks_per_span_batch, Some(2));
+    }
+
+    #[test]
+    fn into_config_uses_default_approximate_compression_ratio() {
+        let cli = parse_cli(&[]);
+        let config = cli.args.into_config().expect("config should build");
+
+        assert_eq!(config.encoder_config.approx_compr_ratio, 0.6);
+    }
+
+    #[test]
+    fn into_config_accepts_approximate_compression_ratio() {
+        let cli = parse_cli(&["--approx-compr-ratio", "0.4"]);
+        let config = cli.args.into_config().expect("config should build");
+
+        assert_eq!(config.encoder_config.approx_compr_ratio, 0.4);
+    }
+
+    #[test]
+    fn into_config_rejects_invalid_approximate_compression_ratio() {
+        let cli = parse_cli(&["--approx-compr-ratio", "0"]);
+        let err = cli.args.into_config().expect_err("zero ratio should fail");
+
+        assert!(err.to_string().contains("approx_compr_ratio"));
     }
 
     #[test]

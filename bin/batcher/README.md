@@ -5,6 +5,13 @@ The Base Batcher binary.
 Submits L2 batch data to the L1 DA layer. Wraps `base-batcher-service` with
 CLI argument parsing and signal handling.
 
+## Span channel sizing
+
+`--approx-compr-ratio` (`BATCHER_APPROX_COMPR_RATIO`) configures the estimated
+compression ratio used to close Span channels. It accepts values in `(0, 1]`
+and defaults to `0.6`. Lower values keep channels open for more RLP input;
+higher values close them earlier. The setting does not affect Single batches.
+
 ## Shadow mode
 
 `base-batcher` normally reads `batch_inbox_address` from the rollup RPC's

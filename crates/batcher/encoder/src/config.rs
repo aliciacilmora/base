@@ -54,6 +54,15 @@ pub struct EncoderConfig {
     /// Default: 1 (one blob per transaction).
     pub target_num_frames: usize,
 
+    /// Compression ratio used to estimate when a Span channel reaches its target.
+    ///
+    /// The Span producer closes the channel when its exact RLP input length reaches
+    /// `target_output_size / approx_compr_ratio`. Compression still runs once when
+    /// the accepted channel is finalized. This setting does not affect Single batches.
+    ///
+    /// Default: `0.6`.
+    pub approx_compr_ratio: f64,
+
     /// Maximum number of L2 blocks to accumulate into one span batch.
     ///
     /// Reaching the limit seals the current span batch and starts another in the
@@ -114,6 +123,7 @@ impl Default for EncoderConfig {
             max_channel_duration: 2,
             sub_safety_margin: 0,
             target_num_frames: 1,
+            approx_compr_ratio: 0.6,
             max_blocks_per_span_batch: None,
             batch_type: BatchType::Single,
             da_type: DaType::Blob,
@@ -138,7 +148,7 @@ impl EncoderConfig {
     ///
     /// Frame metadata is reserved in every frame. Brotli's channel-version byte
     /// is reserved once at the start of the first frame. The Span producer uses
-    /// this value as its channel-size boundary.
+    /// this value to derive its estimated RLP input boundary.
     ///
     /// # Panics
     ///
@@ -148,6 +158,15 @@ impl EncoderConfig {
             usize::from(!matches!(self.compression_algo, CompressionAlgo::Zlib));
         (self.target_frame_size - Frame::ENCODED_OVERHEAD) * self.target_num_frames
             - channel_version_size
+    }
+
+    /// Returns the RLP input size at which a Span channel is considered full.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the configuration has not passed [`Self::validate`].
+    pub fn target_input_size(&self) -> usize {
+        (self.target_output_size() as f64 / self.approx_compr_ratio) as usize
     }
 
     /// Validate the configuration, returning an error if any constraint is violated.
@@ -186,6 +205,12 @@ impl EncoderConfig {
 
         if self.target_num_frames == 0 {
             return Err(EncoderConfigError::TargetNumFramesZero);
+        }
+
+        if !(self.approx_compr_ratio > 0.0 && self.approx_compr_ratio <= 1.0) {
+            return Err(EncoderConfigError::InvalidApproxComprRatio {
+                approx_compr_ratio: self.approx_compr_ratio,
+            });
         }
 
         let target_payload_bytes = self.target_frame_size - Frame::ENCODED_OVERHEAD;
@@ -301,6 +326,12 @@ pub enum EncoderConfigError {
     /// `target_num_frames == 0`.
     #[error("target_num_frames must be greater than zero")]
     TargetNumFramesZero,
+    /// `approx_compr_ratio` is outside `(0.0, 1.0]`.
+    #[error("approx_compr_ratio ({approx_compr_ratio}) must be in the range (0.0, 1.0]")]
+    InvalidApproxComprRatio {
+        /// Configured approximate compression ratio.
+        approx_compr_ratio: f64,
+    },
     /// The total target output size does not fit in a `usize`.
     #[error(
         "target output size overflows usize for target_frame_size {target_frame_size} \
@@ -400,6 +431,7 @@ mod tests {
             cfg.max_frame_size + EncoderConfig::BLOB_DERIVATION_PREFIX_SIZE,
             EncoderConfig::BLOB_MAX_DATA_SIZE
         );
+        assert_eq!(cfg.approx_compr_ratio, 0.6);
         assert_eq!(cfg.max_blocks_per_span_batch, None);
     }
 
@@ -418,6 +450,26 @@ mod tests {
         };
 
         assert_eq!(cfg.target_output_size(), expected);
+    }
+
+    #[rstest]
+    #[case(0.3, 3_333)]
+    #[case(0.4, 2_500)]
+    #[case(0.6, 1_666)]
+    #[case(1.0, 1_000)]
+    fn target_input_size_uses_approximate_ratio(
+        #[case] approx_compr_ratio: f64,
+        #[case] expected: usize,
+    ) {
+        let cfg = EncoderConfig {
+            target_frame_size: Frame::ENCODED_OVERHEAD + 1_000,
+            target_num_frames: 1,
+            compression_algo: CompressionAlgo::Zlib,
+            approx_compr_ratio,
+            ..EncoderConfig::default()
+        };
+
+        assert_eq!(cfg.target_input_size(), expected);
     }
 
     #[rstest]
@@ -504,6 +556,31 @@ mod tests {
         let cfg = EncoderConfig { target_num_frames: 0, ..EncoderConfig::default() };
 
         assert!(matches!(cfg.validate().unwrap_err(), EncoderConfigError::TargetNumFramesZero));
+    }
+
+    #[rstest]
+    #[case(0.3)]
+    #[case(0.4)]
+    #[case(0.6)]
+    #[case(1.0)]
+    fn validate_accepts_approximate_compression_ratio(#[case] approx_compr_ratio: f64) {
+        let cfg = EncoderConfig { approx_compr_ratio, ..EncoderConfig::default() };
+
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[rstest]
+    #[case(0.0)]
+    #[case(-0.1)]
+    #[case(1.1)]
+    #[case(f64::NAN)]
+    #[case(f64::INFINITY)]
+    fn validate_rejects_invalid_approximate_compression_ratio(#[case] approx_compr_ratio: f64) {
+        let cfg = EncoderConfig { approx_compr_ratio, ..EncoderConfig::default() };
+
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, EncoderConfigError::InvalidApproxComprRatio { .. }));
+        assert!(err.to_string().contains("approx_compr_ratio"));
     }
 
     #[test]

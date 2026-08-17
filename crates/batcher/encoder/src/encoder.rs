@@ -834,6 +834,20 @@ mod tests {
         block
     }
 
+    fn make_user_block_with_input_at(
+        parent_hash: B256,
+        number: u64,
+        timestamp: u64,
+        input_len: usize,
+    ) -> BaseBlock {
+        let mut block = make_block_at(parent_hash, number, timestamp);
+        let signed =
+            TxLegacy { nonce: number, input: vec![0; input_len].into(), ..Default::default() }
+                .into_signed(Signature::test_signature());
+        block.body.transactions.push(BaseTxEnvelope::Legacy(signed));
+        block
+    }
+
     fn make_user_tx_chain(len: usize) -> Vec<BaseBlock> {
         let mut parent_hash = B256::ZERO;
         (0..len)
@@ -1664,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rejected_span_candidate_does_not_advance_block_cursor() {
+    fn test_span_input_target_closes_after_committing_candidate() {
         let rollup_config = Arc::new(RollupConfig::default());
         let first = make_block_at(B256::ZERO, 0, 1);
         let first_hash = first.header.hash_slow();
@@ -1672,26 +1686,36 @@ mod tests {
         let probe_config = EncoderConfig {
             batch_type: BatchType::Span,
             compression_algo: crate::CompressionAlgo::Zlib,
+            approx_compr_ratio: 1.0,
             ..EncoderConfig::default()
         };
-        let mut probe = crate::channel::SpanChannel::new(
+        let mut probe = crate::channel::OpenChannel::new(
             ChannelId::default(),
             Arc::clone(&rollup_config),
             &probe_config,
+            0,
+            0,
         );
         let (first_batch, first_l1_info) = BatchComposer::block_to_single_batch(&first).unwrap();
         let (second_batch, second_l1_info) = BatchComposer::block_to_single_batch(&second).unwrap();
-        probe.add_block(first_batch, first_l1_info.sequence_number()).unwrap();
-        let one_block_size = probe.compress_accepted().unwrap();
-        probe.add_block(second_batch, second_l1_info.sequence_number()).unwrap();
-        let two_block_size = probe.compress_accepted().unwrap();
-        assert!(two_block_size > one_block_size + 1);
+        assert_eq!(
+            probe.add_block(first_batch, first_l1_info.sequence_number(), 0).unwrap(),
+            ChannelAddOutcome::Accepted
+        );
+        let one_block_size = probe.input_bytes() as usize;
+        assert_eq!(
+            probe.add_block(second_batch, second_l1_info.sequence_number(), 0).unwrap(),
+            ChannelAddOutcome::Accepted
+        );
+        let two_block_size = probe.input_bytes() as usize;
+        assert!(two_block_size > one_block_size);
 
         let config = EncoderConfig {
             batch_type: BatchType::Span,
             compression_algo: crate::CompressionAlgo::Zlib,
-            target_frame_size: Frame::ENCODED_OVERHEAD + one_block_size + 1,
+            target_frame_size: Frame::ENCODED_OVERHEAD + two_block_size,
             max_channel_duration: 1000,
+            approx_compr_ratio: 1.0,
             ..EncoderConfig::default()
         };
         let mut encoder = BatchEncoder::new(rollup_config, config);
@@ -1700,11 +1724,43 @@ mod tests {
 
         assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
         assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
+        assert_eq!(encoder.block_cursor, 2);
+        assert_eq!(encoder.ready_channels[0].encoded_block_range, 0..2);
+    }
+
+    #[test]
+    fn test_span_rlp_rejection_closes_without_advancing_cursor() {
+        let rollup_config = Arc::new(RollupConfig::default());
+        let max_rlp_bytes = rollup_config.max_rlp_bytes_per_channel(1) as usize;
+        let input_len = max_rlp_bytes / 2 + 1_024;
+        let first = make_user_block_with_input_at(B256::ZERO, 0, 1, input_len);
+        let second = make_user_block_with_input_at(first.header.hash_slow(), 1, 2, input_len);
+        let config = EncoderConfig {
+            batch_type: BatchType::Span,
+            compression_algo: crate::CompressionAlgo::Zlib,
+            max_channel_duration: 1_000,
+            approx_compr_ratio: 0.01,
+            ..EncoderConfig::default()
+        };
+        assert!(config.target_input_size() > max_rlp_bytes);
+
+        let mut encoder = BatchEncoder::new(rollup_config, config);
+        encoder.add_block(first).unwrap();
+        encoder.add_block(second).unwrap();
+
+        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
         assert_eq!(encoder.block_cursor, 1);
-        assert_eq!(encoder.ready_channels[0].encoded_block_range, 0..1);
 
         assert_eq!(encoder.step().unwrap(), StepResult::ChannelClosed);
+        assert_eq!(encoder.block_cursor, 1, "rejected block must remain at the cursor");
+        assert!(encoder.current_channel.is_none());
+        assert_eq!(encoder.ready_channels[0].encoded_block_range, 0..1);
+
+        assert_eq!(encoder.step().unwrap(), StepResult::BlockEncoded);
         assert_eq!(encoder.block_cursor, 2);
+        let retry_channel = encoder.current_channel.as_ref().expect("retry channel should be open");
+        assert_eq!(retry_channel.block_start, 1);
+        assert_eq!(retry_channel.blocks_added, 1);
     }
 
     #[rstest]

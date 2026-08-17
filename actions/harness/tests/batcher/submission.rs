@@ -1,35 +1,11 @@
 //! Action tests for L2 batch submission via the Batcher actor.
 
-use std::sync::Arc;
-
 use base_action_harness::{
     ActionL2Source, ActionTestHarness, Batcher, BatcherConfig, BatcherError, L1MinerConfig,
     SharedL1Chain, TestRollupConfigBuilder,
 };
-use base_batcher_encoder::{BatchEncoder, BatchPipeline, CompressionAlgo, DaType, EncoderConfig};
-use base_common_consensus::BaseBlock;
-use base_common_genesis::RollupConfig;
+use base_batcher_encoder::{CompressionAlgo, DaType, EncoderConfig};
 use base_protocol::{BatchType, Frame};
-
-/// Return the compressed payload size for one unbounded Span channel.
-fn span_channel_size(rollup_config: &RollupConfig, blocks: &[BaseBlock]) -> usize {
-    let config = EncoderConfig {
-        batch_type: BatchType::Span,
-        compression_algo: CompressionAlgo::Brotli10,
-        max_blocks_per_span_batch: Some(1),
-        ..EncoderConfig::default()
-    };
-    let mut encoder = BatchEncoder::new(Arc::new(rollup_config.clone()), config);
-    for block in blocks {
-        encoder.add_block(block.clone()).expect("queue block for size probe");
-    }
-
-    let frames = encoder.encode_and_drain().expect("encode size probe");
-    assert!(!frames.is_empty(), "size probe must produce a frame");
-
-    // Brotli framing adds one channel-version byte outside the compressed payload.
-    frames.iter().map(|frame| frame.data.len()).sum::<usize>() - 1
-}
 
 // ---------------------------------------------------------------------------
 // Batcher: persistent pipeline end-to-end path
@@ -68,13 +44,9 @@ async fn batcher_span_batch_mode() {
     );
 }
 
-/// A Span channel that fits one block but rejects the next must close, retry the
-/// unchanged block in a fresh channel, and still derive the sequencer's exact chain.
-///
-/// `max_blocks_per_span_batch = 1` also exercises sealing multiple Span batches
-/// inside the rejected candidate rather than closing the channel at each seal.
+/// Estimated Span channel boundaries must preserve the sequencer's exact chain.
 #[tokio::test]
-async fn batcher_span_rejection_retry_derives_exact_blocks() {
+async fn batcher_span_size_boundaries_derive_exact_blocks() {
     let base_config = BatcherConfig {
         batch_type: BatchType::Span,
         encoder: EncoderConfig {
@@ -82,6 +54,8 @@ async fn batcher_span_rejection_retry_derives_exact_blocks() {
             batch_type: BatchType::Span,
             da_type: DaType::Calldata,
             compression_algo: CompressionAlgo::Brotli10,
+            target_frame_size: Frame::ENCODED_OVERHEAD + 2,
+            approx_compr_ratio: 1.0,
             ..EncoderConfig::default()
         },
         ..BatcherConfig::default()
@@ -96,34 +70,21 @@ async fn batcher_span_rejection_retry_derives_exact_blocks() {
         blocks.push(sequencer.build_next_block_with_single_transaction().await);
     }
 
-    let one_block_size = span_channel_size(&h.rollup_config, &blocks[..1]);
-    let two_block_size = span_channel_size(&h.rollup_config, &blocks[..2]);
-    let target_output_size = one_block_size + 1;
-    assert!(
-        two_block_size > target_output_size,
-        "test requires the second block to exceed the channel target"
-    );
-
     let (mut node, chain) = h.create_test_rollup_node_from_sequencer(
         &mut sequencer,
         SharedL1Chain::from_blocks(h.l1.chain().to_vec()),
     );
-    let encoder = EncoderConfig {
-        target_frame_size: Frame::ENCODED_OVERHEAD + 1 + target_output_size,
-        ..base_config.encoder.clone()
-    };
-    let config = BatcherConfig { encoder, ..base_config };
     let mut source = ActionL2Source::new();
     for block in &blocks {
         source.push(block.clone());
     }
 
-    Batcher::new(source, &h.rollup_config, config).advance(&mut h.l1).await;
+    Batcher::new(source, &h.rollup_config, base_config).advance(&mut h.l1).await;
     chain.push(h.l1.tip().clone());
 
     node.initialize().await;
     let derived = node.run_until_idle().await;
-    assert_eq!(derived, 4, "all rejected-and-retried blocks must derive");
+    assert_eq!(derived, 4, "all blocks across estimated channel boundaries must derive");
     assert_eq!(node.l2_safe_number(), 4, "safe head must reach the sequencer tip");
     for block in blocks {
         assert_eq!(

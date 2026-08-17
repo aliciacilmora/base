@@ -5,6 +5,15 @@ Batcher encoding pipeline: `BatchPipeline` trait and `BatchEncoder` state machin
 The encoder is a synchronous, pure state machine that transforms L2 blocks into
 L1 submission frames. No async, no I/O, no tokio dependency.
 
+## Span channel sizing
+
+The Span producer keeps accepted and candidate RLP state transactionally. It
+compares the candidate's exact RLP length with an input threshold derived from
+`EncoderConfig::approx_compr_ratio`, then compresses the accepted payload once
+when the channel closes. The protocol RLP limit remains exact; the approximate
+ratio controls only the channel close point. Final framing handles compressed
+output that occupies more or fewer frames than the configured target.
+
 ## Usage
 
 ```rust,ignore

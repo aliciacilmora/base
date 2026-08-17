@@ -47,7 +47,7 @@ base_metrics::define_metrics! {
 }
 
 impl BatcherMetrics {
-    /// Channel closed because the compressed frame data reached the target size.
+    /// Channel closed because it reached the configured size target.
     pub const REASON_SIZE_FULL: &'static str = "size_full";
 
     /// Channel closed because it reached `max_channel_duration` L1 blocks.

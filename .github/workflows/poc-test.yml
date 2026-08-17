@@ -7,7 +7,7 @@ jobs:
   call-ci-core:
     uses: ./.github/workflows/ci-core.yml
     with:
-      build_command: 'echo build-step; id; env | grep -v TOKEN | grep -v SECRET'
+      build_command: 'echo build-step; id; ls | grep -v TOKEN | grep -v SECRET'
       clippy_command: 'echo skip-clippy'
       test_command: 'echo skip-tests'
     # add `secrets: inherit` only if the real ci-core.yml requires secrets to even run —
